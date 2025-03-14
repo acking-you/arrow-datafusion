@@ -23,7 +23,7 @@ use std::collections::HashSet;
 
 use crate::optimizer::ApplyOrder;
 use datafusion_common::tree_node::Transformed;
-use datafusion_expr::utils::evaluates_to_not_true;
+use datafusion_expr::utils::{evaluates_to_not_true, NullColumnsSet};
 use std::sync::Arc;
 
 ///
@@ -77,6 +77,21 @@ impl OptimizerRule for EliminateOuterJoin {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
+        fn schema_columns(schema: &DFSchemaRef) -> NullColumnsSet<'_> {
+            schema
+                .iter()
+                .map(|(qualifier, field)| (qualifier, field.name()))
+                .collect::<HashSet<_>>()
+        }
+
+        fn generate_null_on_left(join_type: JoinType) -> bool {
+            matches!(join_type, JoinType::Right | JoinType::Full)
+        }
+
+        fn generate_null_on_right(join_type: JoinType) -> bool {
+            matches!(join_type, JoinType::Left | JoinType::Full)
+        }
+
         let LogicalPlan::Filter(mut filter) = plan else {
             return Ok(Transformed::no(plan));
         };
@@ -103,21 +118,6 @@ impl OptimizerRule for EliminateOuterJoin {
 
         Ok(Transformed::yes(LogicalPlan::Filter(filter)))
     }
-}
-
-fn schema_columns(schema: &DFSchemaRef) -> HashSet<Column> {
-    schema
-        .iter()
-        .map(|(qualifier, field)| Column::new(qualifier.cloned(), field.name()))
-        .collect::<HashSet<_>>()
-}
-
-fn generate_null_on_left(join_type: JoinType) -> bool {
-    matches!(join_type, JoinType::Right | JoinType::Full)
-}
-
-fn generate_null_on_right(join_type: JoinType) -> bool {
-    matches!(join_type, JoinType::Left | JoinType::Full)
 }
 
 pub fn eliminate_outer(

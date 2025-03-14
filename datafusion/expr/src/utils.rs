@@ -1000,11 +1000,14 @@ pub fn can_hash(data_type: &DataType) -> bool {
     }
 }
 
+/// Metadata for the columns should be null
+pub type NullColumnsSet<'a> = HashSet<(Option<&'a TableReference>, &'a String)>;
+
 /// Determines if an expression will always evaluate to NULL
-pub fn evaluates_to_null(expr: &Expr, null_columns: &HashSet<Column>) -> bool {
+pub fn evaluates_to_null(expr: &Expr, null_columns: &NullColumnsSet<'_>) -> bool {
     match expr {
         Expr::Alias(e) => evaluates_to_null(&e.expr, null_columns),
-        Expr::Column(e) => null_columns.contains(e),
+        Expr::Column(e) => null_columns.contains(&(e.relation.as_ref(), &e.name)),
         Expr::Literal(e) => matches!(e, ScalarValue::Null),
         Expr::BinaryExpr(e) => match e.op {
             Operator::Gt
@@ -1077,7 +1080,7 @@ pub fn evaluates_to_null(expr: &Expr, null_columns: &HashSet<Column>) -> bool {
 }
 
 /// Determines if an expression will always evaluate to a non-TRUE value.
-pub fn evaluates_to_not_true(expr: &Expr, null_columns: &HashSet<Column>) -> bool {
+pub fn evaluates_to_not_true(expr: &Expr, null_columns: &NullColumnsSet<'_>) -> bool {
     match expr {
         Expr::BinaryExpr(e) => match e.op {
             Operator::And => {
@@ -1944,10 +1947,14 @@ mod tests {
     #[test]
     fn test_evaluates_to_null() {
         let col_a = Column::from_name("a");
-        let null_columns = HashSet::from([col_a.clone()]);
+
+        let null_columns = HashSet::from([(col_a.relation.as_ref(), &col_a.name)]);
 
         // column in null_columns
-        assert!(evaluates_to_null(&Expr::Column(col_a), &null_columns));
+        assert!(evaluates_to_null(
+            &Expr::Column(col_a.clone()),
+            &null_columns
+        ));
 
         // a = 1 and b = 2
         assert!(!evaluates_to_null(
@@ -1974,10 +1981,13 @@ mod tests {
     #[test]
     fn test_evaluates_to_not_true() {
         let col_a = Column::from_name("a");
-        let null_columns = HashSet::from([col_a.clone()]);
+        let null_columns = HashSet::from([(col_a.relation.as_ref(), &col_a.name)]);
 
         // column in null_columns
-        assert!(evaluates_to_not_true(&Expr::Column(col_a), &null_columns));
+        assert!(evaluates_to_not_true(
+            &Expr::Column(col_a.clone()),
+            &null_columns
+        ));
 
         // a = 1 and b = 2
         assert!(evaluates_to_not_true(
