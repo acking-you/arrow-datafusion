@@ -858,7 +858,12 @@ fn check_short_circuit<'a>(
                             return ShortCircuitStrategy::ReturnLeft;
                         } else if true_count == array_len {
                             return ShortCircuitStrategy::ReturnRight;
-                        } else if (false_count / array_len) as f32 > 0.5 {
+                        }
+                        // Early filtering will only work correctly when there are no null values,
+                        // because no further "and" calculations will be performed
+                        else if null_count == 0
+                            && (false_count / array_len) as f32 >= 0.8
+                        {
                             return ShortCircuitStrategy::PreSelection(array);
                         } else {
                             return ShortCircuitStrategy::None;
@@ -889,8 +894,6 @@ fn check_short_circuit<'a>(
                             return ShortCircuitStrategy::ReturnLeft;
                         } else if false_count == array_len {
                             return ShortCircuitStrategy::ReturnRight;
-                        } else if (false_count / array_len) as f32 > 0.5 {
-                            return ShortCircuitStrategy::PreSelection(array);
                         } else {
                             return ShortCircuitStrategy::None;
                         }
