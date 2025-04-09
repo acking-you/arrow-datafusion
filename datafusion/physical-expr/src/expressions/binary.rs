@@ -361,8 +361,13 @@ impl PhysicalExpr for BinaryExpr {
         let lhs = self.left.evaluate(batch)?;
 
         // Optimize for short-circuiting `Operator::And` or `Operator::Or` operations and return early.
-        if check_short_circuit(&lhs, &self.op) {
-            return Ok(lhs);
+        match check_short_circuit(&lhs, &self.op) {
+            ShortCircuitStrategy::None => (),
+            ShortCircuitStrategy::ReturnLeft => return Ok(lhs),
+            ShortCircuitStrategy::ReturnRight => return self.right.evaluate(batch),
+            ShortCircuitStrategy::PreSelection(boolean_array) => {
+                return self.right.evaluate_selection(batch, boolean_array);
+            }
         }
 
         let rhs = self.right.evaluate(batch)?;
@@ -828,40 +833,82 @@ impl BinaryExpr {
 /// 2. Handles both scalar values and array values
 /// 3. For arrays, uses optimized `true_count()`/`false_count()` methods from arrow-rs.
 ///    `bool_or`/`bool_and` maybe a better choice too，for detailed discussion,see:[link](https://github.com/apache/datafusion/pull/15462#discussion_r2020558418)
-fn check_short_circuit(arg: &ColumnarValue, op: &Operator) -> bool {
+enum ShortCircuitStrategy<'a> {
+    None,
+    ReturnLeft,
+    ReturnRight,
+    PreSelection(&'a BooleanArray),
+}
+
+fn check_short_circuit<'a>(
+    arg: &'a ColumnarValue,
+    op: &Operator,
+) -> ShortCircuitStrategy<'a> {
     let data_type = arg.data_type();
     match (data_type, op) {
         (DataType::Boolean, Operator::And) => {
             match arg {
                 ColumnarValue::Array(array) => {
-                    if let Ok(array) = as_boolean_array(&array) {
-                        return array.false_count() == array.len();
+                    if let Ok(array) = as_boolean_array(array) {
+                        let array_len = array.len();
+                        let true_count = array.true_count();
+                        let null_count = array.null_count();
+                        let false_count = array_len - true_count - null_count;
+                        if false_count == array_len {
+                            return ShortCircuitStrategy::ReturnLeft;
+                        } else if true_count == array_len {
+                            return ShortCircuitStrategy::ReturnRight;
+                        } else if (false_count / array_len) as f32 > 0.5 {
+                            return ShortCircuitStrategy::PreSelection(array);
+                        } else {
+                            return ShortCircuitStrategy::None;
+                        }
                     }
                 }
                 ColumnarValue::Scalar(scalar) => {
                     if let ScalarValue::Boolean(Some(value)) = scalar {
-                        return !value;
+                        if *value {
+                            return ShortCircuitStrategy::ReturnRight;
+                        } else {
+                            return ShortCircuitStrategy::ReturnLeft;
+                        }
                     }
                 }
             }
-            false
+            ShortCircuitStrategy::None
         }
         (DataType::Boolean, Operator::Or) => {
             match arg {
                 ColumnarValue::Array(array) => {
-                    if let Ok(array) = as_boolean_array(&array) {
-                        return array.true_count() == array.len();
+                    if let Ok(array) = as_boolean_array(array) {
+                        let array_len = array.len();
+                        let true_count = array.true_count();
+                        let null_count = array.null_count();
+                        let false_count = array_len - true_count - null_count;
+                        if true_count == array_len {
+                            return ShortCircuitStrategy::ReturnLeft;
+                        } else if false_count == array_len {
+                            return ShortCircuitStrategy::ReturnRight;
+                        } else if (false_count / array_len) as f32 > 0.5 {
+                            return ShortCircuitStrategy::PreSelection(array);
+                        } else {
+                            return ShortCircuitStrategy::None;
+                        }
                     }
                 }
                 ColumnarValue::Scalar(scalar) => {
                     if let ScalarValue::Boolean(Some(value)) = scalar {
-                        return *value;
+                        if *value {
+                            return ShortCircuitStrategy::ReturnLeft;
+                        } else {
+                            return ShortCircuitStrategy::ReturnRight;
+                        }
                     }
                 }
             }
-            false
+            ShortCircuitStrategy::None
         }
-        _ => false,
+        _ => ShortCircuitStrategy::None,
     }
 }
 
