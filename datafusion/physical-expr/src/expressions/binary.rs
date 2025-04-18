@@ -25,6 +25,7 @@ use crate::intervals::cp_solver::{propagate_arithmetic, propagate_comparison};
 use crate::PhysicalExpr;
 
 use arrow::array::*;
+use arrow::buffer::NullBuffer;
 use arrow::compute::kernels::boolean::{and_kleene, not, or_kleene};
 use arrow::compute::kernels::cmp::*;
 use arrow::compute::kernels::comparison::{regexp_is_match, regexp_is_match_scalar};
@@ -34,8 +35,11 @@ use arrow::compute::{
 };
 use arrow::datatypes::*;
 use arrow::error::ArrowError;
+use arrow::util::bit_util;
 use datafusion_common::cast::as_boolean_array;
-use datafusion_common::{internal_err, not_impl_err, Result, ScalarValue};
+use datafusion_common::{
+    internal_datafusion_err, internal_err, not_impl_err, Result, ScalarValue,
+};
 use datafusion_expr::binary::BinaryTypeCoercer;
 use datafusion_expr::interval_arithmetic::{apply_operator, Interval};
 use datafusion_expr::sort_properties::ExprProperties;
@@ -376,7 +380,7 @@ impl PhysicalExpr for BinaryExpr {
                 // as it takes into account cases where the selection contains null values.
                 let batch = filter_record_batch(batch, selection)?;
                 let right_ret = self.right.evaluate(&batch)?;
-                return pre_selection_scatter(selection, right_ret);
+                return pre_selection_scatter(lhs, right_ret);
             }
         }
 
@@ -973,48 +977,62 @@ fn check_short_circuit<'a>(
 /// Perhaps it would be better to modify `left_result` directly without creating a copy?
 /// In practice, `left_result` should have only one owner, so making changes should be safe.
 /// However, this is difficult to achieve under the immutable constraints of [`Arc`] and [`BooleanArray`].
+#[allow(invalid_reference_casting)]
 fn pre_selection_scatter(
-    left_result: &BooleanArray,
+    left_result: ColumnarValue,
     right_result: ColumnarValue,
 ) -> Result<ColumnarValue> {
+    let left_boolean_array = match &left_result {
+        ColumnarValue::Array(array) => array.as_boolean(),
+        ColumnarValue::Scalar(_) => {
+            return Err(internal_datafusion_err!(
+                "When using pre-selection, left_result must be an boolean array"
+            ));
+        }
+    };
     let right_boolean_array = match &right_result {
         ColumnarValue::Array(array) => array.as_boolean(),
         ColumnarValue::Scalar(_) => return Ok(right_result),
     };
-
-    let result_len = left_result.len();
-
-    let mut result_array_builder = BooleanArray::builder(result_len);
-
+    let (values_buffer, nulls_buffer) = left_boolean_array.clone().into_parts();
+    let nulls_buffer = nulls_buffer.unwrap_or(NullBuffer::new_valid(values_buffer.len()));
+    let ret_values_ptr = values_buffer.inner().as_ptr();
+    let ret_nulls_ptr = nulls_buffer.inner().inner().as_ptr();
     // keep track of current position we have in right boolean array
     let mut right_array_pos = 0;
 
-    // keep track of how much is filled
-    let mut last_end = 0;
-    SlicesIterator::new(left_result).for_each(|(start, end)| {
-        // the gap needs to be filled with false
-        if start > last_end {
-            result_array_builder.append_n(start - last_end, false);
-        }
-
+    SlicesIterator::new(left_boolean_array).for_each(|(start, end)| {
         // copy values from right array for this slice
         let len = end - start;
-        right_boolean_array
+        for (v, i) in right_boolean_array
             .slice(right_array_pos, len)
             .iter()
-            .for_each(|v| result_array_builder.append_option(v));
+            .zip(start..end)
+        {
+            match v {
+                Some(v) => {
+                    if !v {
+                        unsafe {
+                            bit_util::unset_bit_raw(ret_values_ptr as *mut u8, i);
+                        }
+                    }
+                }
+                None => unsafe {
+                    bit_util::unset_bit_raw(ret_nulls_ptr as *mut u8, i);
+                },
+            }
+        }
 
         right_array_pos += len;
-        last_end = end;
     });
 
-    // Fill any remaining positions with false
-    if last_end < result_len {
-        result_array_builder.append_n(result_len - last_end, false);
+    let mut_ptr = left_boolean_array as *const BooleanArray;
+    unsafe {
+        *(mut_ptr as *mut BooleanArray) =
+            BooleanArray::new(values_buffer, Some(nulls_buffer));
     }
-    let boolean_result = result_array_builder.finish();
 
-    Ok(ColumnarValue::Array(Arc::new(boolean_result)))
+    Ok(left_result)
 }
 
 fn concat_elements(left: Arc<dyn Array>, right: Arc<dyn Array>) -> Result<ArrayRef> {
@@ -1077,7 +1095,7 @@ mod tests {
     use datafusion_physical_expr_common::physical_expr::fmt_sql;
 
     use crate::planner::logical2physical;
-    use arrow::array::BooleanArray;
+    use arrow::{array::BooleanArray, util::bit_util};
     use datafusion_expr::col as logical_col;
     /// Performs a binary operation, applying any type coercion necessary
     fn binary_op(
@@ -5226,9 +5244,12 @@ mod tests {
             let right = ColumnarValue::Array(Arc::new(create_bool_array(vec![
                 false, true, false,
             ])));
+            let len = left.len();
 
-            let result = pre_selection_scatter(&left, right).unwrap();
-            let result_arr = result.into_array(left.len()).unwrap();
+            let result =
+                pre_selection_scatter(ColumnarValue::Array(Arc::new(left)), right)
+                    .unwrap();
+            let result_arr = result.into_array(len).unwrap();
 
             let expected = create_bool_array(vec![false, false, true, false, false]);
             assert_eq!(&expected, result_arr.as_boolean());
@@ -5242,9 +5263,12 @@ mod tests {
             let right = ColumnarValue::Array(Arc::new(create_bool_array(vec![
                 true, false, false, true, false,
             ])));
+            let len = left.len();
 
-            let result = pre_selection_scatter(&left, right).unwrap();
-            let result_arr = result.into_array(left.len()).unwrap();
+            let result =
+                pre_selection_scatter(ColumnarValue::Array(Arc::new(left)), right)
+                    .unwrap();
+            let result_arr = result.into_array(len).unwrap();
 
             let expected =
                 create_bool_array(vec![false, true, false, false, false, true, false]);
@@ -5256,9 +5280,12 @@ mod tests {
             // Right: [F]
             let left = create_bool_array(vec![true, false, false]);
             let right = ColumnarValue::Array(Arc::new(create_bool_array(vec![false])));
+            let len = left.len();
 
-            let result = pre_selection_scatter(&left, right).unwrap();
-            let result_arr = result.into_array(left.len()).unwrap();
+            let result =
+                pre_selection_scatter(ColumnarValue::Array(Arc::new(left)), right)
+                    .unwrap();
+            let result_arr = result.into_array(len).unwrap();
 
             let expected = create_bool_array(vec![false, false, false]);
             assert_eq!(&expected, result_arr.as_boolean());
@@ -5269,9 +5296,12 @@ mod tests {
             // Right: [F]
             let left = create_bool_array(vec![false, false, true]);
             let right = ColumnarValue::Array(Arc::new(create_bool_array(vec![false])));
+            let len = left.len();
 
-            let result = pre_selection_scatter(&left, right).unwrap();
-            let result_arr = result.into_array(left.len()).unwrap();
+            let result =
+                pre_selection_scatter(ColumnarValue::Array(Arc::new(left)), right)
+                    .unwrap();
+            let result_arr = result.into_array(len).unwrap();
 
             let expected = create_bool_array(vec![false, false, false]);
             assert_eq!(&expected, result_arr.as_boolean());
@@ -5283,9 +5313,12 @@ mod tests {
             let left = create_bool_array(vec![false, true, false, true]);
             let right_arr = BooleanArray::from(vec![None, Some(false)]);
             let right = ColumnarValue::Array(Arc::new(right_arr));
+            let len = left.len();
 
-            let result = pre_selection_scatter(&left, right).unwrap();
-            let result_arr = result.into_array(left.len()).unwrap();
+            let result =
+                pre_selection_scatter(ColumnarValue::Array(Arc::new(left)), right)
+                    .unwrap();
+            let result_arr = result.into_array(len).unwrap();
 
             let expected = BooleanArray::from(vec![
                 Some(false),
@@ -5293,6 +5326,9 @@ mod tests {
                 Some(false),
                 Some(false),
             ]);
+            let e_nulls = expected.nulls().unwrap().validity();
+            let r_nulls = result_arr.nulls().unwrap().validity();
+            assert_eq!(e_nulls, r_nulls);
             assert_eq!(&expected, result_arr.as_boolean());
         }
         // Test scalar right handling
@@ -5302,7 +5338,9 @@ mod tests {
             let left = create_bool_array(vec![true, false, true]);
             let right = ColumnarValue::Scalar(ScalarValue::Boolean(Some(true)));
 
-            let result = pre_selection_scatter(&left, right).unwrap();
+            let result =
+                pre_selection_scatter(ColumnarValue::Array(Arc::new(left)), right)
+                    .unwrap();
             assert!(matches!(result, ColumnarValue::Scalar(_)));
         }
     }
