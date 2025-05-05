@@ -27,6 +27,8 @@ use arrow::datatypes::ArrowNativeTypeOp;
 use arrow::row::Rows;
 use datafusion_execution::memory_pool::MemoryReservation;
 
+use super::stream::OwnedRows;
+
 /// A comparable collection of values for use with [`Cursor`]
 ///
 /// This is a trait as there are several specialized implementations, such as for
@@ -146,54 +148,75 @@ impl<T: CursorValues> Ord for Cursor<T> {
     }
 }
 
+/// xxx
+#[derive(Debug)]
+pub struct OwnedRowsRef {
+    owned_rows_ref: *const OwnedRows,
+}
+
+unsafe impl Send for OwnedRowsRef {}
+
 /// Implements [`CursorValues`] for [`Rows`]
 ///
 /// Used for sorting when there are multiple columns in the sort key
 #[derive(Debug)]
-pub struct RowValues {
-    rows: Rows,
+pub struct RowsRef {
+    owned_rows_ref: OwnedRowsRef,
 
     /// Tracks for the memory used by in the `Rows` of this
     /// cursor. Freed on drop
     _reservation: MemoryReservation,
 }
 
-impl RowValues {
+impl RowsRef {
     /// Create a new [`RowValues`] from `rows` and a `reservation`
     /// that tracks its memory. There must be at least one row
     ///
     /// Panics if the reservation is not for exactly `rows.size()`
     /// bytes or if `rows` is empty.
-    pub fn new(rows: Rows, reservation: MemoryReservation) -> Self {
+    pub fn new(owned_rows: &OwnedRows, reservation: MemoryReservation) -> Self {
         assert_eq!(
-            rows.size(),
+            owned_rows.cur.size(),
             reservation.size(),
             "memory reservation mismatch"
         );
-        assert!(rows.num_rows() > 0);
+        assert!(owned_rows.cur.num_rows() > 0);
         Self {
-            rows,
+            owned_rows_ref: OwnedRowsRef {
+                owned_rows_ref: owned_rows as *const OwnedRows,
+            },
             _reservation: reservation,
         }
     }
+
+    fn get_cur_rows(&self) -> &Rows {
+        unsafe { &(*self.owned_rows_ref.owned_rows_ref).cur }
+    }
+
+    #[allow(dead_code)]
+    fn get_prev_rows(&self) -> &Rows {
+        unsafe { &(*self.owned_rows_ref.owned_rows_ref).prev }
+    }
 }
 
-impl CursorValues for RowValues {
+impl CursorValues for RowsRef {
     fn len(&self) -> usize {
-        self.rows.num_rows()
+        self.get_cur_rows().num_rows()
     }
 
     fn eq(l: &Self, l_idx: usize, r: &Self, r_idx: usize) -> bool {
-        l.rows.row(l_idx) == r.rows.row(r_idx)
+        l.get_cur_rows().row(l_idx) == r.get_cur_rows().row(r_idx)
     }
 
     fn eq_to_previous(cursor: &Self, idx: usize) -> bool {
         assert!(idx > 0);
-        cursor.rows.row(idx) == cursor.rows.row(idx - 1)
+        cursor.get_cur_rows().row(idx) == cursor.get_cur_rows().row(idx - 1)
     }
 
     fn compare(l: &Self, l_idx: usize, r: &Self, r_idx: usize) -> Ordering {
-        l.rows.row(l_idx).cmp(&r.rows.row(r_idx))
+        l.get_cur_rows()
+            .row(l_idx)
+            .cmp(&r.get_cur_rows().row(r_idx))
     }
 }
 

@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::sorts::cursor::{ArrayValues, CursorArray, RowValues};
+use crate::sorts::cursor::{ArrayValues, CursorArray, RowsRef};
 use crate::SendableRecordBatchStream;
 use crate::{PhysicalExpr, PhysicalSortExpr};
 use arrow::array::Array;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
-use arrow::row::{RowConverter, SortField};
+use arrow::row::{RowConverter, Rows, SortField};
 use datafusion_common::Result;
 use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -76,6 +76,18 @@ impl FusedStreams {
     }
 }
 
+/// xxx
+#[derive(Debug)]
+pub struct OwnedRows {
+    pub prev: Rows,
+    pub cur: Rows,
+}
+
+#[derive(Debug)]
+struct PartitionOwnedRows {
+    owned_rows: Vec<Option<OwnedRows>>,
+}
+
 /// A [`PartitionedStream`] that wraps a set of [`SendableRecordBatchStream`]
 /// and computes [`RowValues`] based on the provided [`PhysicalSortExpr`]
 #[derive(Debug)]
@@ -88,6 +100,7 @@ pub struct RowCursorStream {
     streams: FusedStreams,
     /// Tracks the memory used by `converter`
     reservation: MemoryReservation,
+    partition_rows: PartitionOwnedRows,
 }
 
 impl RowCursorStream {
@@ -105,35 +118,66 @@ impl RowCursorStream {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let num_partitions = streams.len();
         let streams = streams.into_iter().map(|s| s.fuse()).collect();
         let converter = RowConverter::new(sort_fields)?;
+        let owned_rows = (0..num_partitions).map(|_| None).collect::<Vec<_>>();
         Ok(Self {
             converter,
             reservation,
             column_expressions: expressions.iter().map(|x| Arc::clone(&x.expr)).collect(),
             streams: FusedStreams(streams),
+            partition_rows: PartitionOwnedRows { owned_rows },
         })
     }
 
-    fn convert_batch(&mut self, batch: &RecordBatch) -> Result<RowValues> {
+    fn convert_batch(
+        &mut self,
+        batch: &RecordBatch,
+        stream_idx: usize,
+    ) -> Result<RowsRef> {
+        let num_rows = batch.num_rows();
         let cols = self
             .column_expressions
             .iter()
-            .map(|expr| expr.evaluate(batch)?.into_array(batch.num_rows()))
+            .map(|expr| expr.evaluate(batch)?.into_array(num_rows))
             .collect::<Result<Vec<_>>>()?;
-
-        let rows = self.converter.convert_columns(&cols)?;
-        self.reservation.try_resize(self.converter.size())?;
+        let owned_rows = &mut self.partition_rows.owned_rows[stream_idx];
 
         // track the memory in the newly created Rows.
         let mut rows_reservation = self.reservation.new_empty();
-        rows_reservation.try_grow(rows.size())?;
-        Ok(RowValues::new(rows, rows_reservation))
+        let mut append_rows = |rows: &mut Rows| -> Result<()> {
+            self.converter.append(rows, &cols)?;
+            rows_reservation.try_grow(rows.size())?;
+            Ok(())
+        };
+        let owned_rows = match owned_rows {
+            Some(rows) => {
+                std::mem::swap(&mut rows.cur, &mut rows.prev);
+                rows.cur.clear();
+                append_rows(&mut rows.cur)?;
+                rows
+            }
+            None => {
+                let mut cur_rows = self.converter.empty_rows(num_rows, 0);
+                let pre_rows = self.converter.empty_rows(num_rows, 0);
+                append_rows(&mut cur_rows)?;
+                *owned_rows = Some(OwnedRows {
+                    prev: pre_rows,
+                    cur: cur_rows,
+                });
+                owned_rows.as_ref().expect("owned_rows must be Some")
+            }
+        };
+
+        self.reservation.try_resize(self.converter.size())?;
+
+        Ok(RowsRef::new(owned_rows, rows_reservation))
     }
 }
 
 impl PartitionedStream for RowCursorStream {
-    type Output = Result<(RowValues, RecordBatch)>;
+    type Output = Result<(RowsRef, RecordBatch)>;
 
     fn partitions(&self) -> usize {
         self.streams.0.len()
@@ -146,7 +190,7 @@ impl PartitionedStream for RowCursorStream {
     ) -> Poll<Option<Self::Output>> {
         Poll::Ready(ready!(self.streams.poll_next(cx, stream_idx)).map(|r| {
             r.and_then(|batch| {
-                let cursor = self.convert_batch(&batch)?;
+                let cursor = self.convert_batch(&batch, stream_idx)?;
                 Ok((cursor, batch))
             })
         }))
