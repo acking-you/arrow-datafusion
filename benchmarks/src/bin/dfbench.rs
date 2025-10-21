@@ -20,9 +20,13 @@ use datafusion::error::Result;
 
 use structopt::StructOpt;
 
-#[cfg(all(feature = "snmalloc", feature = "mimalloc"))]
+#[cfg(any(
+    all(feature = "snmalloc", feature = "mimalloc"),
+    all(feature = "snmalloc", feature = "jemalloc"),
+    all(feature = "mimalloc", feature = "jemalloc")
+))]
 compile_error!(
-    "feature \"snmalloc\" and feature \"mimalloc\" cannot be enabled at the same time"
+    "Only one allocator feature (snmalloc, mimalloc, or jemalloc) can be enabled at a time"
 );
 
 #[cfg(feature = "snmalloc")]
@@ -31,7 +35,14 @@ static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: mimalloc_rs::MiMalloc = mimalloc_rs::MiMalloc;
+
+#[cfg(feature = "jemalloc")]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 use datafusion_benchmarks::{
     cancellation, clickbench, h2o, hj, imdb, nlj, sort_tpch, tpch,

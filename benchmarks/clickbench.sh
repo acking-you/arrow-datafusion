@@ -100,6 +100,10 @@ BENCHMARK=clickbench_partitioned
 DATAFUSION_DIR=${DATAFUSION_DIR:-$SCRIPT_DIR/..}
 DATA_DIR=${DATA_DIR:-$SCRIPT_DIR/data}
 USE_PREBUILT=${USE_PREBUILT:-0}
+ALLOCATOR=${ALLOCATOR:-jemalloc}
+JEMALLOC_PROFILE=${JEMALLOC_PROFILE:-0}
+JEMALLOC_PROFILE_OUTPUT=${JEMALLOC_PROFILE_OUTPUT:-$SCRIPT_DIR/jeprof_output}
+JEMALLOC_PROFILE_INTERVAL=${JEMALLOC_PROFILE_INTERVAL:-}
 
 # Determine binary execution method
 if [ "$USE_PREBUILT" = "1" ]; then
@@ -112,10 +116,31 @@ if [ "$USE_PREBUILT" = "1" ]; then
     CARGO_COMMAND="$PREBUILT_BIN"
     print_info "Using prebuilt binary: $PREBUILT_BIN"
 else
-    CARGO_COMMAND=${CARGO_COMMAND:-"cargo run --release"}
+    # Set allocator feature flags
+    case "$ALLOCATOR" in
+        jemalloc)
+            ALLOCATOR_FEATURES="--features jemalloc"
+            ;;
+        mimalloc)
+            ALLOCATOR_FEATURES="--no-default-features --features mimalloc"
+            ;;
+        snmalloc)
+            ALLOCATOR_FEATURES="--no-default-features --features snmalloc"
+            ;;
+        system)
+            ALLOCATOR_FEATURES="--no-default-features"
+            ;;
+        *)
+            print_error "Unknown allocator: $ALLOCATOR"
+            print_info "Valid allocators: jemalloc, mimalloc, snmalloc, system"
+            exit 1
+            ;;
+    esac
+    CARGO_COMMAND=${CARGO_COMMAND:-"cargo run --release $ALLOCATOR_FEATURES"}
 fi
 
 VIRTUAL_ENV=${VIRTUAL_ENV:-$SCRIPT_DIR/venv}
+JEMALLOC_UTILS_DIR=${JEMALLOC_UTILS_DIR:-$SCRIPT_DIR/jemalloc-utils}
 
 usage() {
     echo -e "${BOLD}${ROCKET} ClickBench Benchmark Runner for DataFusion${NC}\n"
@@ -125,6 +150,7 @@ usage() {
     echo "  $0 compare <branch1> <branch2>"
     echo "  $0 compare_detail <branch1> <branch2>"
     echo "  $0 venv"
+    echo "  $0 setup_jemalloc_utils"
     echo ""
     print_header "📝 Examples"
     echo "  # Download ClickBench datasets"
@@ -139,12 +165,31 @@ usage() {
     echo "  # Run a specific query (e.g., query 5)"
     echo -e "  ${GREEN}./clickbench.sh run clickbench_1 5${NC}"
     echo ""
+    echo "  # Run multiple queries (e.g., queries 0,5,10)"
+    echo -e "  ${GREEN}QUERIES=\"0,5,10\" ./clickbench.sh run clickbench_1${NC}"
+    echo ""
+    echo "  # Run a range of queries (e.g., queries 0-10)"
+    echo -e "  ${GREEN}QUERIES=\"0-10\" ./clickbench.sh run clickbench_1${NC}"
+    echo ""
+    echo "  # Run mixed query specification (e.g., queries 0,5,10-15,20)"
+    echo -e "  ${GREEN}QUERIES=\"0,5,10-15,20\" ./clickbench.sh run clickbench_1${NC}"
+    echo ""
+    echo "  # Run with mimalloc allocator"
+    echo -e "  ${GREEN}ALLOCATOR=mimalloc ./clickbench.sh run clickbench_1${NC}"
+    echo ""
+    echo "  # Run with jemalloc profiling enabled"
+    echo -e "  ${GREEN}JEMALLOC_PROFILE=1 ./clickbench.sh run clickbench_1${NC}"
+    echo ""
+    echo "  # Run with jemalloc profiling, dump every 512MB"
+    echo -e "  ${GREEN}JEMALLOC_PROFILE=1 JEMALLOC_PROFILE_INTERVAL=512 ./clickbench.sh run clickbench_1${NC}"
+    echo ""
     print_header "🎯 Commands"
-    echo -e "  ${CYAN}data${NC}            Downloads ClickBench data needed for benchmarking"
-    echo -e "  ${CYAN}run${NC}             Runs the named benchmark"
-    echo -e "  ${CYAN}compare${NC}         Compares fastest results from benchmark runs"
-    echo -e "  ${CYAN}compare_detail${NC}  Compares minimum, average (±stddev), and maximum results"
-    echo -e "  ${CYAN}venv${NC}            Creates new venv and installs compare's requirements"
+    echo -e "  ${CYAN}data${NC}                   Downloads ClickBench data needed for benchmarking"
+    echo -e "  ${CYAN}run${NC}                    Runs the named benchmark"
+    echo -e "  ${CYAN}compare${NC}                Compares fastest results from benchmark runs"
+    echo -e "  ${CYAN}compare_detail${NC}         Compares minimum, average (±stddev), and maximum results"
+    echo -e "  ${CYAN}venv${NC}                   Creates new venv and installs compare's requirements"
+    echo -e "  ${CYAN}setup_jemalloc_utils${NC}   Clones jemalloc-utils as a git submodule"
     echo ""
     print_header "📊 Benchmarks"
     echo -e "  ${YELLOW}clickbench_partitioned (default)${NC}  ClickBench queries against partitioned (100 files) parquet (~14GB)"
@@ -154,14 +199,25 @@ usage() {
     echo -e "  ${YELLOW}all${NC}                     Run all ClickBench benchmarks"
     echo ""
     print_header "⚙️  Configuration (Environment Variables)"
-    echo "  DATA_DIR        Directory to store datasets (default: ./data)"
-    echo "  USE_PREBUILT    Use prebuilt binary from ./bin/dfbench (default: 0, set to 1 to use)"
-    echo "  CARGO_COMMAND   Command that runs the benchmark binary (default: cargo run --release)"
-    echo "  DATAFUSION_DIR  DataFusion directory to use (default: parent of script dir)"
-    echo "  RESULTS_NAME    Folder where the benchmark files are stored"
-    echo "  VENV_PATH       Python venv to use for compare (default: ./venv)"
-    echo "  NO_EMOJI        Set to 1 to disable emoji output"
-    echo "  DATAFUSION_*    Set the given datafusion configuration"
+    echo "  DATA_DIR                  Directory to store datasets (default: ./data)"
+    echo "  USE_PREBUILT              Use prebuilt binary from ./bin/dfbench (default: 0, set to 1 to use)"
+    echo "  CARGO_COMMAND             Command that runs the benchmark binary (default: cargo run --release)"
+    echo "  DATAFUSION_DIR            DataFusion directory to use (default: parent of script dir)"
+    echo "  RESULTS_NAME              Folder where the benchmark files are stored"
+    echo "  VENV_PATH                 Python venv to use for compare (default: ./venv)"
+    echo "  NO_EMOJI                  Set to 1 to disable emoji output"
+    echo "  DATAFUSION_*              Set the given datafusion configuration"
+    echo ""
+    echo "  ALLOCATOR                 Memory allocator to use (default: jemalloc)"
+    echo "                            Options: jemalloc, mimalloc, snmalloc, system"
+    echo ""
+    echo "  JEMALLOC_PROFILE          Enable jemalloc profiling (default: 0, set to 1 to enable)"
+    echo "  JEMALLOC_PROFILE_OUTPUT   Output directory for jemalloc profiles (default: ./jeprof_output)"
+    echo "  JEMALLOC_PROFILE_INTERVAL Dump profile every N MB allocated (optional)"
+    echo ""
+    echo "  QUERIES                   Queries to run (default: all queries 0-42)"
+    echo "                            Examples: \"5\" (single), \"0,5,10\" (list),"
+    echo "                            \"0-10\" (range), \"0,5,10-15,20\" (mixed)"
     echo ""
     echo -e "${BOLD}${ROCKET} Using Prebuilt Binaries:${NC}"
     echo "  1. Build locally:      ./build_binaries.sh"
@@ -169,6 +225,130 @@ usage() {
     echo "  3. Or run locally:     USE_PREBUILT=1 ./clickbench.sh run [benchmark]"
     echo ""
     exit 1
+}
+
+# Setup jemalloc-utils submodule
+setup_jemalloc_utils() {
+    print_section "🔧 Setting up jemalloc-utils"
+
+    if [ -d "$JEMALLOC_UTILS_DIR/.git" ]; then
+        print_success "jemalloc-utils already exists at $JEMALLOC_UTILS_DIR"
+        print_info "Updating jemalloc-utils..."
+        pushd "$JEMALLOC_UTILS_DIR" > /dev/null
+        git pull
+        popd > /dev/null
+        print_success "jemalloc-utils updated!"
+    else
+        print_info "Cloning jemalloc-utils to $JEMALLOC_UTILS_DIR..."
+        git clone https://github.com/acking-you/jemalloc-utils.git "$JEMALLOC_UTILS_DIR"
+        print_success "jemalloc-utils cloned successfully!"
+    fi
+
+    print_info "Making scripts executable..."
+    chmod +x "$JEMALLOC_UTILS_DIR"/*.sh
+    print_success "Setup complete!"
+}
+
+# Wrapper function to run command with optional jemalloc profiling
+run_with_profiling() {
+    local cmd="$@"
+
+    if [ "$JEMALLOC_PROFILE" = "1" ] && [ "$ALLOCATOR" = "jemalloc" ]; then
+        print_info "🔬 Jemalloc profiling enabled"
+        print_info "Profile output: $JEMALLOC_PROFILE_OUTPUT"
+
+        # Check if jemalloc_profile.sh exists
+        if [ ! -f "$JEMALLOC_UTILS_DIR/jemalloc_profile.sh" ]; then
+            print_warning "jemalloc_profile.sh not found!"
+            print_info "Run: $0 setup_jemalloc_utils"
+            print_info "Continuing without profiling..."
+            eval "$cmd"
+            return
+        fi
+
+        # When profiling is enabled, we need to build the binary first with debug symbols
+        # because jemalloc_profile.sh needs an executable binary path and jeprof needs symbols
+        if [ "$USE_PREBUILT" != "1" ]; then
+            print_info "Building with 'profiling' profile (optimized + debug symbols) for jemalloc profiling..."
+            cargo build --profile profiling $ALLOCATOR_FEATURES --bin dfbench
+            if [ $? -ne 0 ]; then
+                print_error "Build failed!"
+                exit 1
+            fi
+
+            # Replace cargo run command with direct binary execution
+            local binary_path="${DATAFUSION_DIR}/target/profiling/dfbench"
+            # Extract arguments from the cargo run command
+            # Remove "cargo run --release --features ... --bin dfbench --"
+            local args="${cmd#*-- }"
+            cmd="$binary_path $args"
+            print_info "Using binary: $binary_path"
+        fi
+
+        # Build profiling command
+        PROFILE_CMD="$JEMALLOC_UTILS_DIR/jemalloc_profile.sh -i 500 -o $JEMALLOC_PROFILE_OUTPUT"
+        if [ -n "$JEMALLOC_PROFILE_INTERVAL" ]; then
+            PROFILE_CMD="$PROFILE_CMD -i $JEMALLOC_PROFILE_INTERVAL"
+            print_info "Profile interval: ${JEMALLOC_PROFILE_INTERVAL}MB"
+        fi
+        PROFILE_CMD="$PROFILE_CMD -- $cmd"
+
+        print_info "Running with profiling wrapper..."
+        eval "$PROFILE_CMD"
+
+        print_success "Profiling complete! Analyze with:"
+        if [ "$USE_PREBUILT" = "1" ]; then
+            echo -e "  ${CYAN}jeprof --text $PREBUILT_BIN $JEMALLOC_PROFILE_OUTPUT/jeprof.*.heap | head -30${NC}"
+            echo -e "  ${CYAN}jeprof --pdf $PREBUILT_BIN $JEMALLOC_PROFILE_OUTPUT/jeprof.*.heap > profile.pdf${NC}"
+        else
+            echo -e "  ${CYAN}jeprof --text $binary_path $JEMALLOC_PROFILE_OUTPUT/jeprof.*.heap | head -30${NC}"
+            echo -e "  ${CYAN}jeprof --pdf $binary_path $JEMALLOC_PROFILE_OUTPUT/jeprof.*.heap > profile.pdf${NC}"
+        fi
+    else
+        eval "$cmd"
+    fi
+}
+
+# Parse QUERIES environment variable and expand into individual query numbers
+# Supports formats:
+#   - Single query: "5" -> (5)
+#   - Comma-separated list: "0,5,10" -> (0 5 10)
+#   - Range: "0-10" -> (0 1 2 3 4 5 6 7 8 9 10)
+#   - Mixed: "0,5,10-15,20" -> (0 5 10 11 12 13 14 15 20)
+# Returns empty array if QUERIES is not set (run all queries)
+parse_queries() {
+    local queries_spec="$1"
+
+    if [ -z "$queries_spec" ]; then
+        echo ""
+        return
+    fi
+
+    local result=()
+    IFS=',' read -ra parts <<< "$queries_spec"
+
+    for part in "${parts[@]}"; do
+        # Trim whitespace
+        part=$(echo "$part" | xargs)
+
+        if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            # Range format: start-end
+            local start="${BASH_REMATCH[1]}"
+            local end="${BASH_REMATCH[2]}"
+            for ((i=start; i<=end; i++)); do
+                result+=($i)
+            done
+        elif [[ "$part" =~ ^[0-9]+$ ]]; then
+            # Single number
+            result+=($part)
+        else
+            print_error "Invalid query specification: '$part'"
+            print_info "Expected a number or range (e.g., '5' or '0-10')"
+            return 1
+        fi
+    done
+
+    echo "${result[@]}"
 }
 
 # Downloads the single file hits.parquet ClickBench dataset
@@ -235,11 +415,37 @@ run_clickbench_1() {
         exit 1
     fi
 
-    if [ "$USE_PREBUILT" = "1" ]; then
-        debug_run $CARGO_COMMAND clickbench --iterations 5 --path "${DATA_DIR}/hits.parquet" --queries-path "${SCRIPT_DIR}/queries/clickbench/queries" -o "${RESULTS_FILE}" ${QUERY_ARG}
+    # Determine which queries to run
+    local queries_to_run
+    if [ -n "$QUERY_ARG" ]; then
+        # Single query from command line
+        queries_to_run=("$QUERY_ARG")
+    elif [ -n "$QUERIES" ]; then
+        # Multiple queries from QUERIES env var
+        queries_to_run=($(parse_queries "$QUERIES"))
+        if [ $? -ne 0 ]; then
+            exit 1
+        fi
     else
-        debug_run $CARGO_COMMAND --bin dfbench -- clickbench --iterations 5 --path "${DATA_DIR}/hits.parquet" --queries-path "${SCRIPT_DIR}/queries/clickbench/queries" -o "${RESULTS_FILE}" ${QUERY_ARG}
+        # Run all queries
+        queries_to_run=("")
     fi
+
+    # Run benchmarks
+    for query_num in "${queries_to_run[@]}"; do
+        local cmd_query_arg=""
+        if [ -n "$query_num" ]; then
+            cmd_query_arg="--query $query_num"
+            print_info "Running query $query_num..."
+        fi
+
+        if [ "$USE_PREBUILT" = "1" ]; then
+            run_with_profiling $CARGO_COMMAND clickbench --iterations 5 --path \"${DATA_DIR}/hits.parquet\" --queries-path \"${SCRIPT_DIR}/queries/clickbench/queries\" -o \"${RESULTS_FILE}\" $cmd_query_arg
+        else
+            run_with_profiling $CARGO_COMMAND --bin dfbench -- clickbench --iterations 5 --path \"${DATA_DIR}/hits.parquet\" --queries-path \"${SCRIPT_DIR}/queries/clickbench/queries\" -o \"${RESULTS_FILE}\" $cmd_query_arg
+        fi
+    done
+
     print_success "Benchmark completed! Results saved to ${RESULTS_FILE}"
 }
 
@@ -255,11 +461,34 @@ run_clickbench_partitioned() {
         exit 1
     fi
 
-    if [ "$USE_PREBUILT" = "1" ]; then
-        debug_run $CARGO_COMMAND clickbench --iterations 5 --path "${DATA_DIR}/hits_partitioned" --queries-path "${SCRIPT_DIR}/queries/clickbench/queries" -o "${RESULTS_FILE}" ${QUERY_ARG}
+    # Determine which queries to run
+    local queries_to_run
+    if [ -n "$QUERY_ARG" ]; then
+        queries_to_run=("$QUERY_ARG")
+    elif [ -n "$QUERIES" ]; then
+        queries_to_run=($(parse_queries "$QUERIES"))
+        if [ $? -ne 0 ]; then
+            exit 1
+        fi
     else
-        debug_run $CARGO_COMMAND --bin dfbench -- clickbench --iterations 5 --path "${DATA_DIR}/hits_partitioned" --queries-path "${SCRIPT_DIR}/queries/clickbench/queries" -o "${RESULTS_FILE}" ${QUERY_ARG}
+        queries_to_run=("")
     fi
+
+    # Run benchmarks
+    for query_num in "${queries_to_run[@]}"; do
+        local cmd_query_arg=""
+        if [ -n "$query_num" ]; then
+            cmd_query_arg="--query $query_num"
+            print_info "Running query $query_num..."
+        fi
+
+        if [ "$USE_PREBUILT" = "1" ]; then
+            run_with_profiling $CARGO_COMMAND clickbench --iterations 5 --path \"${DATA_DIR}/hits_partitioned\" --queries-path \"${SCRIPT_DIR}/queries/clickbench/queries\" -o \"${RESULTS_FILE}\" $cmd_query_arg
+        else
+            run_with_profiling $CARGO_COMMAND --bin dfbench -- clickbench --iterations 5 --path \"${DATA_DIR}/hits_partitioned\" --queries-path \"${SCRIPT_DIR}/queries/clickbench/queries\" -o \"${RESULTS_FILE}\" $cmd_query_arg
+        fi
+    done
+
     print_success "Benchmark completed! Results saved to ${RESULTS_FILE}"
 }
 
@@ -276,11 +505,34 @@ run_clickbench_pushdown() {
         exit 1
     fi
 
-    if [ "$USE_PREBUILT" = "1" ]; then
-        debug_run $CARGO_COMMAND clickbench --pushdown --iterations 5 --path "${DATA_DIR}/hits_partitioned" --queries-path "${SCRIPT_DIR}/queries/clickbench/queries" -o "${RESULTS_FILE}" ${QUERY_ARG}
+    # Determine which queries to run
+    local queries_to_run
+    if [ -n "$QUERY_ARG" ]; then
+        queries_to_run=("$QUERY_ARG")
+    elif [ -n "$QUERIES" ]; then
+        queries_to_run=($(parse_queries "$QUERIES"))
+        if [ $? -ne 0 ]; then
+            exit 1
+        fi
     else
-        debug_run $CARGO_COMMAND --bin dfbench -- clickbench --pushdown --iterations 5 --path "${DATA_DIR}/hits_partitioned" --queries-path "${SCRIPT_DIR}/queries/clickbench/queries" -o "${RESULTS_FILE}" ${QUERY_ARG}
+        queries_to_run=("")
     fi
+
+    # Run benchmarks
+    for query_num in "${queries_to_run[@]}"; do
+        local cmd_query_arg=""
+        if [ -n "$query_num" ]; then
+            cmd_query_arg="--query $query_num"
+            print_info "Running query $query_num..."
+        fi
+
+        if [ "$USE_PREBUILT" = "1" ]; then
+            run_with_profiling $CARGO_COMMAND clickbench --pushdown --iterations 5 --path \"${DATA_DIR}/hits_partitioned\" --queries-path \"${SCRIPT_DIR}/queries/clickbench/queries\" -o \"${RESULTS_FILE}\" $cmd_query_arg
+        else
+            run_with_profiling $CARGO_COMMAND --bin dfbench -- clickbench --pushdown --iterations 5 --path \"${DATA_DIR}/hits_partitioned\" --queries-path \"${SCRIPT_DIR}/queries/clickbench/queries\" -o \"${RESULTS_FILE}\" $cmd_query_arg
+        fi
+    done
+
     print_success "Benchmark completed! Results saved to ${RESULTS_FILE}"
 }
 
@@ -296,11 +548,34 @@ run_clickbench_extended() {
         exit 1
     fi
 
-    if [ "$USE_PREBUILT" = "1" ]; then
-        debug_run $CARGO_COMMAND clickbench --iterations 5 --path "${DATA_DIR}/hits.parquet" --queries-path "${SCRIPT_DIR}/queries/clickbench/extended" -o "${RESULTS_FILE}" ${QUERY_ARG}
+    # Determine which queries to run
+    local queries_to_run
+    if [ -n "$QUERY_ARG" ]; then
+        queries_to_run=("$QUERY_ARG")
+    elif [ -n "$QUERIES" ]; then
+        queries_to_run=($(parse_queries "$QUERIES"))
+        if [ $? -ne 0 ]; then
+            exit 1
+        fi
     else
-        debug_run $CARGO_COMMAND --bin dfbench -- clickbench --iterations 5 --path "${DATA_DIR}/hits.parquet" --queries-path "${SCRIPT_DIR}/queries/clickbench/extended" -o "${RESULTS_FILE}" ${QUERY_ARG}
+        queries_to_run=("")
     fi
+
+    # Run benchmarks
+    for query_num in "${queries_to_run[@]}"; do
+        local cmd_query_arg=""
+        if [ -n "$query_num" ]; then
+            cmd_query_arg="--query $query_num"
+            print_info "Running query $query_num..."
+        fi
+
+        if [ "$USE_PREBUILT" = "1" ]; then
+            run_with_profiling $CARGO_COMMAND clickbench --iterations 5 --path \"${DATA_DIR}/hits.parquet\" --queries-path \"${SCRIPT_DIR}/queries/clickbench/extended\" -o \"${RESULTS_FILE}\" $cmd_query_arg
+        else
+            run_with_profiling $CARGO_COMMAND --bin dfbench -- clickbench --iterations 5 --path \"${DATA_DIR}/hits.parquet\" --queries-path \"${SCRIPT_DIR}/queries/clickbench/extended\" -o \"${RESULTS_FILE}\" $cmd_query_arg
+        fi
+    done
+
     print_success "Benchmark completed! Results saved to ${RESULTS_FILE}"
 }
 
@@ -445,10 +720,15 @@ main() {
         run)
             BENCHMARK=${ARG2:-"${BENCHMARK}"}
             EXTRA_ARGS=("${POSITIONAL_ARGS[@]:2}")
-            QUERY=${EXTRA_ARGS[0]}
-            QUERY_ARG=""
-            if [ -n "$QUERY" ]; then
-                QUERY_ARG="--query ${QUERY}"
+            QUERY_ARG=${EXTRA_ARGS[0]}
+
+            # Determine what queries will be run for display purposes
+            if [ -n "$QUERY_ARG" ]; then
+                QUERY_DISPLAY="Query $QUERY_ARG"
+            elif [ -n "$QUERIES" ]; then
+                QUERY_DISPLAY="Queries: $QUERIES"
+            else
+                QUERY_DISPLAY="All queries"
             fi
 
             BRANCH_NAME=$(cd "${DATAFUSION_DIR}" && git rev-parse --abbrev-ref HEAD)
@@ -459,12 +739,22 @@ main() {
             print_header "${ROCKET} ClickBench Benchmark Runner"
             echo -e "  ${BOLD}Command:${NC}         ${COMMAND}"
             echo -e "  ${BOLD}Benchmark:${NC}       ${BENCHMARK}"
-            echo -e "  ${BOLD}Query:${NC}           ${QUERY:-All queries}"
+            echo -e "  ${BOLD}Query:${NC}           ${QUERY_DISPLAY}"
             echo -e "  ${BOLD}DataFusion Dir:${NC}  ${DATAFUSION_DIR}"
             echo -e "  ${BOLD}Branch:${NC}          ${BRANCH_NAME}"
             echo -e "  ${BOLD}Data Dir:${NC}        ${DATA_DIR}"
             echo -e "  ${BOLD}Results Dir:${NC}     ${RESULTS_DIR}"
-            echo -e "  ${BOLD}Cargo Command:${NC}   ${CARGO_COMMAND}"
+            echo -e "  ${BOLD}Allocator:${NC}       ${ALLOCATOR}"
+            if [ "$JEMALLOC_PROFILE" = "1" ]; then
+                echo -e "  ${BOLD}Build Command:${NC}   cargo build --profile profiling $ALLOCATOR_FEATURES --bin dfbench"
+                echo -e "  ${BOLD}Profiling:${NC}       ${GREEN}Enabled${NC}"
+                echo -e "  ${BOLD}Profile Output:${NC}  ${JEMALLOC_PROFILE_OUTPUT}"
+                if [ -n "$JEMALLOC_PROFILE_INTERVAL" ]; then
+                    echo -e "  ${BOLD}Profile Interval:${NC} ${JEMALLOC_PROFILE_INTERVAL}MB"
+                fi
+            else
+                echo -e "  ${BOLD}Cargo Command:${NC}   ${CARGO_COMMAND}"
+            fi
             echo ""
 
             pushd "${DATAFUSION_DIR}/benchmarks" > /dev/null
@@ -518,6 +808,9 @@ main() {
             ;;
         venv)
             setup_venv
+            ;;
+        setup_jemalloc_utils)
+            setup_jemalloc_utils
             ;;
         "")
             usage

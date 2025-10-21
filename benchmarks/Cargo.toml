@@ -31,8 +31,10 @@ workspace = true
 
 [features]
 ci = []
-default = ["mimalloc"]
+default = ["jemalloc"]
+jemalloc = ["tikv-jemallocator"]
 snmalloc = ["snmalloc-rs"]
+mimalloc = ["dep:mimalloc"]
 mimalloc_extended = ["libmimalloc-sys/extended"]
 
 [dependencies]
@@ -43,7 +45,7 @@ env_logger = { workspace = true }
 futures = { workspace = true }
 libmimalloc-sys = { version = "0.1", optional = true }
 log = { workspace = true }
-mimalloc = { version = "0.1", optional = true, default-features = false }
+mimalloc = { version = "0.1", optional = true }
 object_store = { workspace = true }
 parquet = { workspace = true, default-features = true }
 rand = { workspace = true }
@@ -52,6 +54,12 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { workspace = true }
 snmalloc-rs = { version = "0.3", optional = true }
 structopt = { version = "0.3", default-features = false }
+tikv-jemallocator = { version = "0.6", features = [
+    "profiling",
+    "override_allocator_on_supported_platforms",
+    "stats",
+    "debug",
+], optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "parking_lot"] }
 tokio-util = { version = "0.7.16" }
 
